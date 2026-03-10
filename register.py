@@ -586,6 +586,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "content-type": "application/json",
             },
             data=select_body,
+            timeout=45,
         )
 
         if select_resp.status_code != 200:
@@ -600,7 +601,7 @@ def run(proxy: Optional[str]) -> Optional[str]:
 
         current_url = continue_url
         for _ in range(6):
-            final_resp = s.get(current_url, allow_redirects=False, timeout=15)
+            final_resp = s.get(current_url, allow_redirects=False, timeout=45)
             location = final_resp.headers.get("Location") or ""
 
             if final_resp.status_code not in [301, 302, 303, 307, 308]:
@@ -656,12 +657,14 @@ def main() -> None:
             if token_json:
                 try:
                     t_data = json.loads(token_json)
-                    fname_email = t_data.get("email", "unknown").replace("@", "_")
+                    fname_email = t_data.get("email", "unknown")
                 except Exception:
                     fname_email = "unknown"
 
-                os.makedirs("tokens", exist_ok=True)
-                file_name = os.path.join("tokens", f"token_{fname_email}_{int(time.time())}.json")
+                # Save directly to CLIProxyAPIPlus directory
+                cpa_dir = os.path.expanduser("~/.cli-proxy-api")
+                os.makedirs(cpa_dir, exist_ok=True)
+                file_name = os.path.join(cpa_dir, f"codex-{fname_email}.json")
 
                 with open(file_name, "w", encoding="utf-8") as f:
                     f.write(token_json)

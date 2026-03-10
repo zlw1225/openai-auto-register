@@ -2,11 +2,11 @@
 """
 OpenAI 自动注册脚本
 用法:
-  python3 run.py                          # 循环注册
-  python3 run.py --once                   # 只跑一次
-  python3 run.py --count 5                # 跑5个
-  python3 run.py --parallel 3             # 3线程无限循环
-  python3 run.py --count 10 --parallel 3  # 3线程跑10个
+  python run.py                          # 循环注册
+  python run.py --once                   # 只跑一次
+  python run.py --count 10                # 跑10个
+  python run.py --parallel 3             # 3线程无限循环
+  python run.py --count 10 --parallel 3  # 3线程跑10个
 """
 import json
 import os
@@ -64,13 +64,15 @@ def run_once(cfg: dict, tag: str = "") -> bool:
     token_data = json.loads(token_json)
     email = token_data.get("email", "unknown")
 
-    # 保存 token 文件
-    os.makedirs(TOKENS_DIR, exist_ok=True)
-    fname = f"token_{email.replace('@', '_')}_{int(time.time())}.json"
-    fpath = os.path.join(TOKENS_DIR, fname)
-    with open(fpath, "w") as f:
+    # 保存 token 文件直接到 CPA 目录
+    cpa_dir = os.path.expanduser("~/.cli-proxy-api")
+    os.makedirs(cpa_dir, exist_ok=True)
+    
+    fname = f"codex-{email}.json"
+    fpath = os.path.join(cpa_dir, fname)
+    with open(fpath, "w", encoding="utf-8") as f:
         f.write(token_json)
-    _tprint(f"{tag}[*] Token 已保存: {fpath}")
+    _tprint(f"{tag}[*] Token 己保存直接到 CPA 目录: {fpath}")
 
     log_result(email, True, token_data.get("account_id", ""))
     return True
@@ -79,7 +81,7 @@ def run_once(cfg: dict, tag: str = "") -> bool:
 def main():
     parser = argparse.ArgumentParser(description="OpenAI 自动注册工具")
     parser.add_argument("--once", action="store_true", help="只跑一次")
-    parser.add_argument("--count", type=int, default=0, help="跑指定次数（0=无限循环）")
+    parser.add_argument("--count", type=int, default=10, help="跑指定次数（0=无限循环，默认是10）")
     parser.add_argument("--parallel", type=int, default=1, help="并行线程数（默认1）")
     args = parser.parse_args()
 

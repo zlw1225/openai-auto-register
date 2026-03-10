@@ -63,6 +63,24 @@ python3 run.py
 python3 register.py --once --proxy http://127.0.0.1:7890
 ```
 
+### Kiro 生产线（与 codex 独立）
+
+> 这个流程不做 Kiro 注册，只做「导入/转换已有 Kiro 凭据」并写入 CPAPlus 目录。
+
+```bash
+# 预览将导入哪些 Kiro 凭据（不写文件）
+python3 run_kiro.py --dry-run
+
+# 从默认 Kiro 凭据目录导入到 CPAPlus（~/.cli-proxy-api）
+python3 run_kiro.py
+
+# 指定输入文件导入
+python3 run_kiro.py --input ~/.aws/sso/cache/kiro-auth-token.json
+
+# 允许覆盖同名目标文件
+python3 run_kiro.py --overwrite
+```
+
 ---
 
 ## 文件说明
@@ -71,9 +89,10 @@ python3 register.py --once --proxy http://127.0.0.1:7890
 |------|------|
 | `register.py` | 核心注册逻辑，可独立运行 |
 | `run.py` | 批量/并行运行脚本，读取 config.json |
+| `run_kiro.py` | Kiro 凭据导入管线（写入 `~/.cli-proxy-api/kiro-*.json`） |
 | `config.json.example` | 配置文件模板，复制为 config.json 后使用 |
 | `requirements.txt` | Python 依赖列表 |
-| `tokens/` | 注册成功的 Token 存放目录（自动创建） |
+| `~/.cli-proxy-api/` | codex/kiro 凭据目录（CPAPlus 读取） |
 | `history.log` | 注册历史日志（自动创建） |
 
 ---
