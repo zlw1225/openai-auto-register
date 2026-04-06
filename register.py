@@ -35,6 +35,8 @@ from curl_cffi import requests
 # ==========================================
 
 MAILTM_BASE = "https://api.mail.tm"
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+DEFAULT_PASSWORD = "66661adcchat"
 
 
 def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, str]:
@@ -227,8 +229,142 @@ def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
 # OAuth 授权与辅助函数
 # ==========================================
 
+def _is_valid_email(email: str) -> bool:
+    return bool(EMAIL_RE.match((email or "").strip()))
+
+
+def prompt_user_email(initial_email: str = "") -> str:
+    email = (initial_email or "").strip()
+    while True:
+        if not email:
+            email = input("[?] Enter registration email: ").strip()
+        if _is_valid_email(email):
+            return email
+        print("[Error] Invalid email format. Try again.")
+        email = ""
+
+
+def _default_inbox_url(email: str) -> str:
+    return f"https://mail.chatgpt.org.uk/{quote(email, safe='@')}"
+
+
+def try_fetch_otp_via_playwright(inbox_email: str, timeout_sec: int = 90) -> str:
+    inbox_url = _default_inbox_url(inbox_email)
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        print(f"[*] Playwright unavailable: {e}")
+        return ""
+
+    code_patterns = [
+        re.compile(r"Your ChatGPT code is\s*(\d{6})", re.IGNORECASE),
+        re.compile(r"ChatGPT code is\s*(\d{6})", re.IGNORECASE),
+        re.compile(r"OpenAI code is\s*(\d{6})", re.IGNORECASE),
+        re.compile(r"(?<!\d)(\d{6})(?!\d)"),
+    ]
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(inbox_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+            deadline = time.time() + max(timeout_sec, 5)
+            while time.time() < deadline:
+                text = page.locator("body").inner_text(timeout=10000)
+                text = text.encode("ascii", "replace").decode("ascii")
+                for pattern in code_patterns:
+                    m = pattern.search(text)
+                    if m:
+                        browser.close()
+                        code = m.group(1)
+                        print(f"[*] Auto-fetched OTP via Playwright: {code}")
+                        return code
+                page.wait_for_timeout(5000)
+                page.reload(wait_until="domcontentloaded", timeout=60000)
+            browser.close()
+    except Exception as e:
+        print(f"[*] Playwright OTP fetch failed: {e}")
+        return ""
+
+    return ""
+
+
+def prompt_user_otp(
+    email: str,
+    inbox_email: Optional[str] = None,
+    inbox_url: Optional[str] = None,
+    auto_fetch: bool = True,
+    resend_otp=None,
+) -> str:
+    otp_inbox_email = (inbox_email or email or "").strip()
+    if not _is_valid_email(otp_inbox_email):
+        raise RuntimeError("OTP inbox email is invalid.")
+
+    resolved_inbox_url = (inbox_url or "").strip()
+    if not resolved_inbox_url:
+        try:
+            with open("config.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            resolved_inbox_url = str(cfg.get("inbox_url") or "").strip()
+        except Exception:
+            resolved_inbox_url = ""
+    if not resolved_inbox_url:
+        resolved_inbox_url = _default_inbox_url(otp_inbox_email)
+
+    resent_once = False
+
+    def maybe_resend_otp(reason: str) -> None:
+        nonlocal resent_once
+        if resend_otp is None:
+            return
+        print(f"[*] Triggering OTP resend: {reason}")
+        status, text = resend_otp()
+        print(f"[*] Resend OTP status: {status}")
+        if text:
+            print(text)
+        if status == 200:
+            resent_once = True
+
+    print(f"[*] Inbox URL: {resolved_inbox_url}")
+    if auto_fetch:
+        print("[*] Trying to fetch OTP from GPTMail via Playwright...")
+        code = try_fetch_otp_via_playwright(otp_inbox_email)
+        if code:
+            return code
+        if not resent_once:
+            maybe_resend_otp("initial auto-fetch timeout")
+            code = try_fetch_otp_via_playwright(otp_inbox_email, timeout_sec=60)
+            if code:
+                return code
+    if not sys.stdin.isatty():
+        raise RuntimeError("Auto OTP fetch failed and stdin is not interactive. Use a fresh email or rerun interactively.")
+    while True:
+        code = input(
+            f"[?] Enter the 6-digit code sent to {email}. Press Enter to keep waiting, r to resend, or q to quit: "
+        ).strip()
+        if not code:
+            if auto_fetch:
+                code = try_fetch_otp_via_playwright(otp_inbox_email, timeout_sec=30)
+                if code:
+                    return code
+            if not resent_once:
+                maybe_resend_otp("manual wait timeout")
+            print(f"[*] Still waiting. Open {resolved_inbox_url} and check the inbox/spam folder.")
+            continue
+        if code.lower() == "r":
+            maybe_resend_otp("user requested resend")
+            continue
+        if code.lower() == "q":
+            raise RuntimeError("User cancelled before receiving the verification code.")
+        if re.fullmatch(r"\d{6}", code):
+            return code
+        print("[Error] Invalid code format. Enter exactly 6 digits.")
+
+
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
+EMAIL_OTP_SEND_URL = "https://auth.openai.com/api/accounts/email-otp/send"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 DEFAULT_REDIRECT_URI = "http://localhost:1455/auth/callback"
@@ -352,6 +488,31 @@ def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, A
         ) from exc
 
 
+def _send_email_otp(session: requests.Session) -> tuple[int, str]:
+    resp = session.get(
+        EMAIL_OTP_SEND_URL,
+        headers={
+            "referer": "https://auth.openai.com/create-account/password",
+            "accept": "application/json",
+        },
+        timeout=30,
+    )
+    return resp.status_code, resp.text
+
+
+def _send_passwordless_otp(session: requests.Session) -> tuple[int, str]:
+    resp = session.post(
+        "https://auth.openai.com/api/accounts/passwordless/send-otp",
+        headers={
+            "referer": "https://auth.openai.com/create-account/password",
+            "accept": "application/json",
+            "content-type": "application/json",
+        },
+        timeout=30,
+    )
+    return resp.status_code, resp.text
+
+
 @dataclass(frozen=True)
 class OAuthStart:
     auth_url: str
@@ -453,7 +614,14 @@ def submit_callback_url(
 # ==========================================
 
 
-def run(proxy: Optional[str]) -> Optional[str]:
+def run(
+    proxy: Optional[str],
+    email: Optional[str] = None,
+    password: str = DEFAULT_PASSWORD,
+    auto_fetch_otp: bool = True,
+    inbox_email: Optional[str] = None,
+    inbox_url: Optional[str] = None,
+) -> Optional[str]:
     proxies: Any = None
     if proxy:
         proxies = {"http": proxy, "https": proxy}
@@ -472,10 +640,10 @@ def run(proxy: Optional[str]) -> Optional[str]:
         print(f"[Error] 网络连接检查失败: {e}")
         return None
 
-    email, dev_token = get_email_and_token(proxies)
-    if not email or not dev_token:
-        return None
-    print(f"[*] 成功获取 Mail.tm 邮箱与授权: {email}")
+    email = prompt_user_email(email)
+    password = (password or "").strip() or DEFAULT_PASSWORD
+    print(f"[*] 本次注册使用邮箱: {email}")
+    print(f"[*] 本次注册使用密码: {password[:4]}{'*' * max(len(password) - 4, 0)}")
 
     oauth = generate_oauth_url()
     url = oauth.auth_url
@@ -485,7 +653,14 @@ def run(proxy: Optional[str]) -> Optional[str]:
         did = s.cookies.get("oai-did")
         print(f"[*] Device ID: {did}")
 
-        signup_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"signup"}}'
+        signup_body = json.dumps(
+            {
+                "username": {"value": email, "kind": "email"},
+                "screen_hint": "signup",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         sen_req_body = f'{{"p":"","id":"{did}","flow":"authorize_continue"}}'
 
         sen_resp = requests.post(
@@ -518,21 +693,67 @@ def run(proxy: Optional[str]) -> Optional[str]:
             },
             data=signup_body,
         )
-        print(f"[*] 提交注册表单状态: {signup_resp.status_code}")
+        print(f"[*] Email submit status: {signup_resp.status_code}")
+        if signup_resp.text:
+            print(signup_resp.text)
+        if signup_resp.status_code != 200:
+            return None
 
-        otp_resp = s.post(
-            "https://auth.openai.com/api/accounts/passwordless/send-otp",
+        continue_url = str((signup_resp.json() or {}).get("continue_url") or "").strip()
+        if continue_url:
+            password_page_resp = s.get(continue_url, timeout=30)
+            print(f"[*] Password page status: {password_page_resp.status_code}")
+            if password_page_resp.status_code != 200:
+                print(password_page_resp.text)
+                return None
+
+        register_resp = s.post(
+            "https://auth.openai.com/api/accounts/user/register",
             headers={
                 "referer": "https://auth.openai.com/create-account/password",
                 "accept": "application/json",
                 "content-type": "application/json",
             },
+            data=json.dumps({"username": email, "password": password}, separators=(",", ":")),
+            timeout=30,
         )
-        print(f"[*] 验证码发送状态: {otp_resp.status_code}")
+        print(f"[*] User register status: {register_resp.status_code}")
+        if register_resp.text:
+            print(register_resp.text)
+        otp_send_status = 0
+        otp_send_text = ""
 
-        code = get_oai_code(dev_token, email, proxies)
-        if not code:
+        if register_resp.status_code == 200:
+            otp_send_url = str((register_resp.json() or {}).get("continue_url") or "").strip()
+            if otp_send_url:
+                global EMAIL_OTP_SEND_URL
+                EMAIL_OTP_SEND_URL = otp_send_url
+            otp_send_status, otp_send_text = _send_email_otp(s)
+            print(f"[*] OTP send status: {otp_send_status}")
+            if otp_send_text:
+                print(otp_send_text)
+        else:
+            print("[*] user/register failed, fallback to legacy passwordless/send-otp flow.")
+            otp_send_status, otp_send_text = _send_passwordless_otp(s)
+            print(f"[*] Legacy OTP send status: {otp_send_status}")
+            if otp_send_text:
+                print(otp_send_text)
+
+        if otp_send_status != 200:
+            print("[Error] OTP send failed in both current and legacy flows.")
             return None
+
+        otp_inbox_email = (inbox_email or email or "").strip()
+        print(f"[*] OTP inbox email: {otp_inbox_email}")
+        print("[*] Check the mailbox via the direct inbox URL, then enter the verification code.")
+        resend_otp = _send_email_otp if register_resp.status_code == 200 else _send_passwordless_otp
+        code = prompt_user_otp(
+            email,
+            inbox_email=otp_inbox_email,
+            inbox_url=inbox_url,
+            auto_fetch=auto_fetch_otp,
+            resend_otp=lambda: resend_otp(s),
+        )
 
         code_body = f'{{"code":"{code}"}}'
         code_resp = s.post(
@@ -546,7 +767,14 @@ def run(proxy: Optional[str]) -> Optional[str]:
         )
         print(f"[*] 验证码校验状态: {code_resp.status_code}")
 
-        create_account_body = '{"name":"Neo","birthdate":"2000-02-20"}'
+        create_account_body = json.dumps(
+            {
+                "name": "Neo",
+                "birthdate": "2000-02-20",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         create_account_resp = s.post(
             "https://auth.openai.com/api/accounts/create_account",
             headers={
@@ -628,15 +856,30 @@ def run(proxy: Optional[str]) -> Optional[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本")
-    parser.add_argument(
-        "--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890"
+    parser = argparse.ArgumentParser(
+        description="OpenAI Auto-Register Script",
+        epilog=(
+            "Examples:\n"
+            "  python register.py --email user@example.com\n"
+            "  python register.py --email user@example.com --manual-otp\n"
+            "  python register.py --proxy http://127.0.0.1:7890 --email user@example.com\n"
+            "  python register.py --email user@example.com --inbox-email inbox@example.com"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("--once", action="store_true", help="只运行一次")
-    parser.add_argument("--sleep-min", type=int, default=5, help="循环模式最短等待秒数")
     parser.add_argument(
-        "--sleep-max", type=int, default=30, help="循环模式最长等待秒数"
+        "--proxy", default=None, help="Proxy address, e.g. http://127.0.0.1:7890"
     )
+    parser.add_argument("--once", action="store_true", help="Run once")
+    parser.add_argument("--sleep-min", type=int, default=5, help="Minimum wait seconds in loop mode")
+    parser.add_argument(
+        "--sleep-max", type=int, default=30, help="Maximum wait seconds in loop mode"
+    )
+    parser.add_argument("--email", default=None, help="Specify registration email")
+    parser.add_argument("--inbox-email", default=None, help="Specify the mailbox email used to receive OTP")
+    parser.add_argument("--inbox-url", default=None, help="Specify the direct inbox URL used to open the OTP mailbox")
+    parser.add_argument("--password", default=DEFAULT_PASSWORD, help="Registration password")
+    parser.add_argument("--manual-otp", action="store_true", help="Disable Playwright auto OTP fetch")
     args = parser.parse_args()
 
     sleep_min = max(1, args.sleep_min)
@@ -647,12 +890,17 @@ def main() -> None:
 
     while True:
         count += 1
-        print(
-            f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 <<<"
-        )
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> Start signup attempt {count} <<<")
 
         try:
-            token_json = run(args.proxy)
+            token_json = run(
+                args.proxy,
+                args.email,
+                args.password,
+                not args.manual_otp,
+                args.inbox_email,
+                args.inbox_url,
+            )
 
             if token_json:
                 try:
@@ -661,7 +909,6 @@ def main() -> None:
                 except Exception:
                     fname_email = "unknown"
 
-                # Save directly to CLIProxyAPIPlus directory
                 cpa_dir = os.path.expanduser("~/.cli-proxy-api")
                 os.makedirs(cpa_dir, exist_ok=True)
                 file_name = os.path.join(cpa_dir, f"codex-{fname_email}.json")
@@ -669,20 +916,19 @@ def main() -> None:
                 with open(file_name, "w", encoding="utf-8") as f:
                     f.write(token_json)
 
-                print(f"[*] 成功! Token 已保存至: {file_name}")
+                print(f"[*] Success! Token saved to: {file_name}")
             else:
-                print("[-] 本次注册失败。")
+                print("[-] Signup failed.")
 
         except Exception as e:
-            print(f"[Error] 发生未捕获异常: {e}")
+            print(f"[Error] Unhandled exception: {e}")
 
         if args.once:
             break
 
         wait_time = random.randint(sleep_min, sleep_max)
-        print(f"[*] 休息 {wait_time} 秒...")
+        print(f"[*] Sleep {wait_time}s...")
         time.sleep(wait_time)
-
 
 if __name__ == "__main__":
     main()
